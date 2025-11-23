@@ -1,77 +1,66 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import os
-from estimate_fuel_quality import load_models_and_scaler, estimate_quality, FEATURE_ORDER, TARGETS
+import pandas as pd
+from estimate_fuel_quality import load_models_and_scaler, estimate_quality, TARGETS, get_feature_order_from_properties
 
 st.set_page_config(page_title="Fuel Quality Predictor", layout="centered")
+st.title("Fuel Quality Predictor")
 
-st.title("Fuel Quality Prediction App")
+st.markdown("This app imputes missing CN/BP50/FREEZE values (if left blank) and evaluates fuel against specs.")
 
-st.markdown("""
-This app predicts missing fuel properties using trained ML models  
-and evaluates the fuel quality against specification limits.
-""")
-
-# -------------------------------
-# Load models + scaler
-# -------------------------------
-st.subheader("Model Loading Status")
-
+# Load models (shows status)
 scaler, pls, rf = load_models_and_scaler()
-
 if scaler is None and pls is None and rf is None:
-    st.error("❌ No models could be loaded. Ensure scaler.joblib, pls_model.joblib, rf_model.zip/joblib are in repo root.")
+    st.error("No models loaded. Make sure scaler.joblib, pls_model.joblib, and rf_model.zip/joblib are in the repo root.")
 else:
-    st.success("✅ Models loaded successfully.")
+    st.success("Models loaded (if any).")
 
+# Determine features from diesel_properties_clean.xlsx
+prop_candidates = ["./diesel_properties_clean.xlsx", "./diesel_properties_clean.xls", "/mnt/data/diesel_properties_clean.xlsx"]
+prop_path = next((p for p in prop_candidates if os.path.exists(p)), None)
+if prop_path is None:
+    st.error("diesel_properties_clean.xlsx not found in repo root. The app needs it to determine input fields.")
+    st.stop()
 
-# -------------------------------
-# Input Section
-# -------------------------------
-st.header("Enter Fuel Properties")
+# Use the helper to get FEATURE_ORDER dynamically (drops TARGETS)
+FEATURE_ORDER = get_feature_order_from_properties(path_candidates=[prop_path], drop_targets=TARGETS)
 
+st.subheader("Enter measured properties (leave blank to impute)")
+st.write("Detected feature columns from your dataset (these are the model inputs):")
+st.write(FEATURE_ORDER)
+
+# Collect inputs for features
 inputs = {}
+cols = st.columns(2)
+for i, feat in enumerate(FEATURE_ORDER):
+    with cols[i % 2]:
+        v = st.text_input(f"{feat} (leave blank if unknown)", value="")
+        if v is not None and str(v).strip() != "":
+            try:
+                inputs[feat] = float(v)
+            except:
+                st.warning(f"Could not parse {feat}; ignoring the provided value.")
 
-# Inputs for normal features
-for feature in FEATURE_ORDER:
-    val = st.text_input(f"{feature} (leave blank if unknown)")
-    if val.strip() != "":
-        try:
-            inputs[feature] = float(val)
-        except:
-            st.warning(f"Value for {feature} is invalid, ignoring.")
-
-# Optional target inputs (CN, BP50, FREEZE)
-st.subheader("Optional: Enter Target Properties (Will be predicted if left blank)")
+st.subheader("Optional: provide targets (these will be used if you enter them; otherwise they'll be imputed)")
 for t in TARGETS:
-    val = st.text_input(f"{t} (optional)")
-    if val.strip() != "":
+    v = st.text_input(f"{t} (optional)", value="")
+    if v is not None and str(v).strip() != "":
         try:
-            inputs[t] = float(val)
+            inputs[t] = float(v)
         except:
-            st.warning(f"Invalid value for {t}, ignoring.")
+            st.warning(f"Could not parse {t}; ignoring the provided value.")
 
-
-# -------------------------------
-# Run Prediction
-# -------------------------------
+# Button to estimate
 if st.button("Estimate Fuel Quality"):
     try:
-        result = estimate_quality(inputs, scaler, pls, rf)
-
-        st.success("Prediction Completed.")
-
-        st.subheader("Filled Input (after imputing missing values)")
-        st.json(result["filled_input"])
-
-        st.subheader("Evaluation Against Specs")
-        st.json(result["evaluation"])
-
-        st.header(f"Overall Score: {result['evaluation']['score_percent']:.2f}%")
-
+        res = estimate_quality(inputs, scaler, pls, rf)
+        st.success("Done.")
+        st.subheader("Filled Input (after imputation)")
+        st.json(res["filled_input"])
+        st.subheader("Evaluation against specs")
+        st.json(res["evaluation"])
+        score = res["evaluation"].get("score_percent")
+        if score is not None:
+            st.metric("Overall score (%)", f"{score:.2f}")
     except Exception as e:
-        st.error(f"Something went wrong: {e}")
-
-st.markdown("---")
-st.caption("Make sure all required .joblib/.zip/.xlsx files are in the GitHub repo root.")
+        st.error(f"Estimation failed: {e}")
