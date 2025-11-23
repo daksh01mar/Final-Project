@@ -2,126 +2,123 @@
 """
 estimate_fuel_quality.py
 
-Updated to support model/scaler files provided either as:
- - plain joblib files (e.g. scaler.joblib)
- - or zip archives that contain joblib/pickle artifacts (e.g. rf_model.zip)
-
-Place this file in the repo root alongside (or point the constants to) your artifacts:
-  - scaler.joblib  OR scaler.zip (containing scaler.joblib)
+Loads scaler/PLS/RF models (supports .joblib or .zip containing joblib),
+reads dataset header to determine feature order, imputes missing targets,
+and evaluates against specs.
+Place this file in repo root alongside:
+  - scaler.joblib  OR scaler.zip
   - pls_model.joblib OR pls_model.zip
   - rf_model.joblib OR rf_model.zip
   - diesel_properties_clean.xlsx
   - diesel_spec.xlsx
 """
 
-import json
-import sys
 import os
+import joblib
+import zipfile
 import tempfile
 import shutil
-from typing import Dict, Any, Tuple, List, Optional
-import joblib
+from typing import Any, Tuple, Dict, List, Optional
 import numpy as np
 import pandas as pd
-import zipfile
 
-# ---- CONFIG ----
-ROOT = "."  # repository root where everything lives
-SCALER_PATH = os.path.join(ROOT, "scaler.joblib")      # or scaler.zip
-PLS_MODEL_PATH = os.path.join(ROOT, "pls_model.joblib")# or pls_model.zip
+# ------- Paths (repo root) -------
+ROOT = "."
+SCALER_PATH = os.path.join(ROOT, "scaler.joblib")
+PLS_MODEL_PATH = os.path.join(ROOT, "pls_model.joblib")
 RF_MODEL_PATH = os.path.join(ROOT, "rf_model.joblib")  # or rf_model.zip
 PROPERTIES_XLSX = os.path.join(ROOT, "diesel_properties_clean.xlsx")
 SPECS_XLSX = os.path.join(ROOT, "diesel_spec.xlsx")
 
-# If you uploaded a zip to a different path (e.g. /mnt/data/rf_model.zip),
-# set the constant accordingly or pass a full path in your environment.
-# Example (environment): RF_MODEL_PATH = "/mnt/data/rf_model.zip"
-
-FEATURE_ORDER = [
-    "Density_15", "Viscosity", "Sulfur", "Ash", "FlashPoint", "Distillation_BPoint",
-    "Aromatics", "PAH", "Cetane_Index", "API"
-]
-
+# Default target names in your dataset (from your header)
 TARGETS = ["CN", "BP50", "FREEZE"]
 
-# ---- UTIL: load joblib or extract from zip ----
+# ----------------- Helpers to load joblib or from zip -----------------
 
-def _find_candidate_in_zip(z: zipfile.ZipFile, candidates_ext=(".joblib", ".pkl", ".sav")) -> Optional[str]:
-    """
-    Return the first file in the zip that ends with one of candidates_ext (case-insensitive).
-    """
+def _find_candidate_in_zip(z: zipfile.ZipFile, ext_choices=(".joblib", ".pkl", ".sav")) -> Optional[str]:
     for name in z.namelist():
-        lname = name.lower()
-        for ext in candidates_ext:
-            if lname.endswith(ext):
-                return name
+        if name.lower().endswith(ext_choices):
+            return name
     return None
 
 def safe_load(path: str, inner_filename: Optional[str] = None):
-    """
-    Load a joblib/pickle object from either:
-      - a plain file path (joblib/pkl), or
-      - a zip file containing the serialized artifact.
-    If path is a zip and inner_filename is None, the first matching candidate (.joblib/.pkl/.sav)
-    inside the zip will be loaded.
-    """
+    """Load a joblib/pickle from a file or from inside a zip archive."""
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Required file not found: {path}")
+        raise FileNotFoundError(f"File not found: {path}")
 
-    # If it's a zip file: open, extract candidate file to tempdir, load and cleanup.
     if path.lower().endswith(".zip"):
         tmpdir = tempfile.mkdtemp(prefix="model_zip_")
         try:
             with zipfile.ZipFile(path, "r") as z:
-                target = inner_filename
+                target = inner_filename or _find_candidate_in_zip(z)
                 if target is None:
-                    target = _find_candidate_in_zip(z)
-                    if target is None:
-                        raise FileNotFoundError(f"No .joblib/.pkl/.sav artifact found inside zip: {path}")
-                # Extract the selected file
+                    raise FileNotFoundError(f"No joblib/pkl found inside zip: {path}")
                 z.extract(member=target, path=tmpdir)
                 extracted_path = os.path.join(tmpdir, target)
-                # If the member is stored with directories inside the zip, ensure path exists
-                # joblib.load accepts filenames; use extracted_path
                 return joblib.load(extracted_path)
         finally:
-            # remove the temporary directory and its contents
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Not a zip — load directly
     return joblib.load(path)
 
 def load_models_and_scaler() -> Tuple[Any, Any, Any]:
-    """Load scaler, pls, rf models from repo root. Supports zipped artifacts too."""
-    scaler = None
-    pls = None
-    rf = None
-    try:
-        scaler = safe_load(SCALER_PATH)
-    except Exception as e:
-        print(f"[warning] Could not load scaler at {SCALER_PATH}: {e}")
-
-    try:
-        pls = safe_load(PLS_MODEL_PATH)
-    except Exception as e:
-        print(f"[warning] Could not load PLS model at {PLS_MODEL_PATH}: {e}")
-
-    try:
-        rf = safe_load(RF_MODEL_PATH)
-    except Exception as e:
-        print(f"[warning] Could not load RF model at {RF_MODEL_PATH}: {e}")
+    """Attempt to load scaler, pls, rf from repo root (supports zip)."""
+    scaler = pls = rf = None
+    # attempt scaler
+    for p in [SCALER_PATH, SCALER_PATH.replace(".joblib", ".zip")]:
+        if os.path.exists(p):
+            try:
+                scaler = safe_load(p)
+                break
+            except Exception as e:
+                print(f"[warning] cannot load scaler from {p}: {e}")
+    # attempt pls
+    for p in [PLS_MODEL_PATH, PLS_MODEL_PATH.replace(".joblib", ".zip")]:
+        if os.path.exists(p):
+            try:
+                pls = safe_load(p)
+                break
+            except Exception as e:
+                print(f"[warning] cannot load pls from {p}: {e}")
+    # attempt rf
+    for p in [RF_MODEL_PATH, RF_MODEL_PATH.replace(".joblib", ".zip")]:
+        if os.path.exists(p):
+            try:
+                rf = safe_load(p)
+                break
+            except Exception as e:
+                print(f"[warning] cannot load rf from {p}: {e}")
 
     return scaler, pls, rf
 
-# ---- rest of the script (unchanged logic, with minor robustness tweaks) ----
+# ----------------- Feature order detection -----------------
 
-def read_specs(specs_path: str = SPECS_XLSX) -> pd.DataFrame:
-    """Read specs Excel and return a DataFrame."""
-    if not os.path.exists(specs_path):
-        raise FileNotFoundError(f"Spec file not found: {specs_path}")
-    df = pd.read_excel(specs_path)
-    df.columns = [c.strip() for c in df.columns]
-    return df
+def get_feature_order_from_properties(path_candidates: List[str] = None, drop_targets: List[str] = None) -> List[str]:
+    """
+    Read the header row of diesel_properties_clean.xlsx and return columns
+    excluding the TARGETS (drop_targets).
+    """
+    if path_candidates is None:
+        path_candidates = [PROPERTIES_XLSX, os.path.join("/mnt/data", "diesel_properties_clean.xlsx")]
+    if drop_targets is None:
+        drop_targets = TARGETS
+
+    p = next((pp for pp in path_candidates if os.path.exists(pp)), None)
+    if p is None:
+        # fallback minimal guess
+        print("[warning] properties file not found; using fallback feature order.")
+        return [c for c in ["D4052", "FLASH", "TOTAL", "VISC"] if c not in drop_targets]
+
+    df = pd.read_excel(p, nrows=0)
+    cols = list(df.columns)
+    # default behavior: features are all columns except the targets
+    features = [c for c in cols if c not in drop_targets]
+    return features
+
+# Determine FEATURE_ORDER at import time
+FEATURE_ORDER = get_feature_order_from_properties()
+
+# ----------------- Prediction / imputation -----------------
 
 def prepare_feature_array(input_dict: Dict[str, Any], feature_order: List[str]) -> np.ndarray:
     arr = []
@@ -130,31 +127,33 @@ def prepare_feature_array(input_dict: Dict[str, Any], feature_order: List[str]) 
         arr.append(np.nan if v is None else v)
     return np.array(arr, dtype=float).reshape(1, -1)
 
-def impute_with_model(X_row: np.ndarray, scaler, model) -> float:
-    X = X_row.copy()
-    if np.isnan(X).any():
-        # try to use dataset column means
-        try:
-            df = pd.read_excel(PROPERTIES_XLSX)
-            col_means = {}
-            for i, col in enumerate(FEATURE_ORDER):
-                if col in df.columns:
-                    col_means[i] = float(df[col].dropna().mean())
-                else:
-                    col_means[i] = 0.0
-            for i in range(X.shape[1]):
-                if np.isnan(X[0, i]):
-                    X[0, i] = col_means.get(i, 0.0)
-        except Exception:
-            X = np.nan_to_num(X, nan=0.0)
+def _fill_nan_with_means(X: np.ndarray, properties_path: str = PROPERTIES_XLSX) -> np.ndarray:
+    """If X has NaNs, try to replace with column means from properties file; else zeros."""
+    if not np.isnan(X).any():
+        return X
+    try:
+        df = pd.read_excel(properties_path)
+        means = []
+        for i, col in enumerate(FEATURE_ORDER):
+            if col in df.columns:
+                means.append(float(df[col].dropna().mean()))
+            else:
+                means.append(0.0)
+        Xf = X.copy()
+        for i in range(X.shape[1]):
+            if np.isnan(Xf[0, i]):
+                Xf[0, i] = means[i]
+        return Xf
+    except Exception:
+        return np.nan_to_num(X, nan=0.0)
 
+def impute_with_model(X_row: np.ndarray, scaler, model) -> float:
+    X = _fill_nan_with_means(X_row)
     if scaler is not None:
         try:
             X = scaler.transform(X)
         except Exception:
-            # if scaler fails, proceed without scaling
             pass
-
     y = model.predict(X)
     if np.asarray(y).ndim > 1:
         y = np.asarray(y).ravel()
@@ -162,20 +161,29 @@ def impute_with_model(X_row: np.ndarray, scaler, model) -> float:
     return float(y)
 
 def predict_missing_properties(input_dict: Dict[str, Any], scaler, pls, rf) -> Dict[str, Any]:
-    filled = input_dict.copy()
+    """
+    Use RF if available else PLS to predict missing targets (CN/BP50/FREEZE).
+    Uses FEATURE_ORDER discovered from the properties file.
+    """
+    filled = dict(input_dict)
     predicted = {}
     missing = [t for t in TARGETS if t not in filled or filled.get(t) is None or pd.isna(filled.get(t))]
     if not missing:
+        filled["_imputed"] = {}
+        filled["_imputation_model"] = None
         return filled
 
     X = prepare_feature_array(filled, FEATURE_ORDER)
-    model_used = rf if rf is not None else pls if pls is not None else None
-    if model_used is None:
-        print("[warning] No model available for imputation (RF/PLS missing).")
+    model = rf if rf is not None else pls if pls is not None else None
+    if model is None:
+        print("[warning] No imputation model available (rf/pls missing).")
+        filled["_imputed"] = {}
+        filled["_imputation_model"] = None
         return filled
 
     try:
-        pred = impute_with_model(X, scaler, model_used)
+        pred = impute_with_model(X, scaler, model)
+        # If model returns multiple outputs, map to TARGETS if lengths match
         if isinstance(pred, (list, np.ndarray)) and len(pred) == len(TARGETS):
             for i, t in enumerate(TARGETS):
                 if t in missing:
@@ -186,24 +194,32 @@ def predict_missing_properties(input_dict: Dict[str, Any], scaler, pls, rf) -> D
             filled[first] = float(pred)
             predicted[first] = float(pred)
     except Exception as e:
-        print(f"[warning] Imputation attempt failed: {e}")
+        print(f"[warning] imputation failed: {e}")
 
     filled["_imputed"] = predicted
-    filled["_imputation_model"] = ("rf" if rf is not None else "pls") if model_used is not None else None
+    filled["_imputation_model"] = ("rf" if rf is not None else "pls") if model is not None else None
     return filled
+
+# ----------------- Spec evaluation -----------------
+
+def read_specs(specs_path: str = SPECS_XLSX) -> pd.DataFrame:
+    if not os.path.exists(specs_path):
+        # try /mnt/data fallback
+        alt = os.path.join("/mnt/data", os.path.basename(specs_path))
+        if os.path.exists(alt):
+            specs_path = alt
+        else:
+            raise FileNotFoundError(f"Spec file not found at {specs_path}")
+    df = pd.read_excel(specs_path)
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
 def evaluate_against_specs(fuel_params: Dict[str, Any], specs_df: pd.DataFrame) -> Dict[str, Any]:
     result = {}
     passed = 0
     total = 0
-    param_col = None
-    for cand in ["Parameter", "parameter", "Param", "param", "Name", "name"]:
-        if cand in specs_df.columns:
-            param_col = cand
-            break
-    if param_col is None:
-        param_col = specs_df.columns[0]
-
+    # find parameter column
+    param_col = next((c for c in specs_df.columns if c.lower() in ("parameter","param","name")), specs_df.columns[0])
     min_col = next((c for c in specs_df.columns if "min" in c.lower()), None)
     max_col = next((c for c in specs_df.columns if "max" in c.lower()), None)
 
@@ -243,47 +259,19 @@ def evaluate_against_specs(fuel_params: Dict[str, Any], specs_df: pd.DataFrame) 
     score = (passed / total * 100.0) if total > 0 else None
     return {"per_parameter": result, "passed": passed, "total": total, "score_percent": score}
 
+# ----------------- High-level API -----------------
+
 def estimate_quality(input_dict: Dict[str, Any], scaler, pls, rf, specs_path: str = SPECS_XLSX) -> Dict[str, Any]:
-    fuel = input_dict.copy()
-    fuel_filled = predict_missing_properties(fuel, scaler, pls, rf)
-    try:
-        specs_df = read_specs(specs_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read spec file: {e}")
+    fuel_filled = predict_missing_properties(input_dict, scaler, pls, rf)
+    specs_df = read_specs(specs_path)
     evaluation = evaluate_against_specs(fuel_filled, specs_df)
-    res = {
-        "input_original": input_dict,
-        "filled_input": fuel_filled,
-        "evaluation": evaluation
-    }
-    return res
+    return {"input_original": input_dict, "filled_input": fuel_filled, "evaluation": evaluation}
 
-def example_usage():
-    print("Example usage (python script):")
-    print("  python estimate_fuel_quality.py demo")
-    print("  or import and call estimate_quality() from another script.")
-
-def demo_run():
-    print("Running demo with example inputs...")
-    scaler, pls, rf = load_models_and_scaler()
-    sample_input = {
-        "Density_15": 835.0,
-        "Viscosity": 3.8,
-        "Sulfur": 12.0,
-    }
-    res = estimate_quality(sample_input, scaler, pls, rf)
-    print(json.dumps(res, indent=2, default=str))
-
+# For quick tests
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1].lower() == "demo":
-        demo_run()
-    elif len(sys.argv) >= 2 and sys.argv[1].lower() == "help":
-        example_usage()
-    else:
-        print("estimate_fuel_quality.py - updated to support zipped model artifacts.")
-        print("Expected files (either .joblib/.pkl or .zip containing them):")
-        print(f"  SCALER: {SCALER_PATH}")
-        print(f"  PLS:    {PLS_MODEL_PATH}")
-        print(f"  RF:     {RF_MODEL_PATH}")
-        print("")
-        print("To run demo: python estimate_fuel_quality.py demo")
+    sc, pl, rf = load_models_and_scaler()
+    print("FEATURE_ORDER:", FEATURE_ORDER)
+    sample = {"D4052": 830.0, "FLASH": 60.0, "TOTAL": 12.0, "VISC": 3.5}
+    res = estimate_quality(sample, sc, pl, rf)
+    import json
+    print(json.dumps(res, indent=2, default=str))
